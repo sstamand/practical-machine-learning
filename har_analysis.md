@@ -1,0 +1,257 @@
+# Human Activity Recognition (HAR) Excercise Analysis
+sstamand  
+November 18, 2017  
+
+
+
+## Synopsis
+
+The question being aaddressed in this analysis is: Can we predict the manner in which a unilateral dumbbel biceps curl was performed? There are five classes of the way the activity can be performed: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+The [Human Activity Recognition (HAR)][1] data is used for this analysis. Data recorded on the uses glove, armband, lumbar belt, dumbbell. Features on Euler angles (roll, pitch and yaw) were calculated on a sliding window, as well as the raw accelerometer, gyroscope, and magnetometer readings. The dimensionality of these data were reduced for each sensor using principal component analysis.
+
+Four models were trained, with random forest being the best predictor. The estimated out-of-sample error rate is 25.8 percent.
+
+[1]: http://groupware.les.inf.puc-rio.br/har#literature "link to the website for the data"
+
+## Load and Clean Data
+
+
+```r
+training <- read.csv("pml-training.csv", na.strings = c("NA", "", "."), stringsAsFactors = FALSE)
+testing <- read.csv("pml-testing.csv", na.strings = c("NA", "", "."), stringsAsFactors = FALSE)
+```
+
+There were a lot of data with most observation equal to NA. To remove this information, data with over 90 observations missing are removed from the dataset.Data with near zero variance are also removed from the data. The findCorrelation() function is used to identify and remove variables with high pair-wise correlation. These three operation reduced the number of potential explanatory variables from 159 to 46.
+
+
+```r
+training <- training[c(2,8:ncol(training))]
+testing <- testing[c(2,8:ncol(testing))]
+## remove data that are mostly NA
+na_vector <- apply(training, 2, function(z) sum(is.na(z))) < 0.90*nrow(training)
+training <- training[,na_vector]
+testing <- testing[,na_vector]
+## remove variables with near zero variance
+nearZeroVar(training)
+```
+
+```
+## integer(0)
+```
+
+```r
+training$user_name <- as.factor(training$user_name)
+training$classe <- as.factor(training$classe)
+testing$user_name <- as.factor(testing$user_name)
+## remove variables with high correlation
+variables <- training[,2:(ncol(training)-1)]
+variables_cormatrix <- cor(variables)
+high_corr_vars <- names(variables)[findCorrelation(variables_cormatrix)]
+training <- training[,-which(names(training) %in% high_corr_vars)]
+testing <- testing[,-which(names(testing) %in% high_corr_vars)]
+```
+
+## Build Features
+
+For each of the sensors of the belt, arm, dumbbell, and forearm the statistical parameters are reduced to two dimensions using principal component analysis.
+
+
+```r
+belt_pc <- preProcess(training[,grep("belt", names(training))], method = "pca", pcaComp = 2)
+belt <- predict(belt_pc, training[,grep("belt", names(training))])
+arm_pc <- preProcess(training[,grep("_arm", names(training))], method = "pca", pcaComp = 2)
+arm <- predict(arm_pc, training[,grep("_arm", names(training))])
+dumbbell_pc <- preProcess(training[,grep("dumbbell", names(training))], method = "pca", pcaComp = 2)
+dumbbell <- predict(dumbbell_pc, training[,grep("dumbbell", names(training))])
+forearm_pc <- preProcess(training[,grep("forearm", names(training))], method = "pca", pcaComp = 2)
+forearm <- predict(forearm_pc, training[,grep("forearm", names(training))])
+training <- cbind(training[1], belt, arm, dumbbell, forearm, training[ncol(training)])
+colnames(training) <- c("user_name", "belt_pc1", "belt_pc2", "arm_pc1", "arm_pc2", "dumbbell_pc1", "dumbbell_pc2", "forearm_pc1", "forearm_pc2", "classe")
+
+## apply the same method to testing set
+belt_test <- predict(belt_pc, testing[,grep("belt", names(testing))])
+arm_test <- predict(arm_pc, testing[,grep("_arm", names(testing))])
+dumbbell_test <- predict(dumbbell_pc, testing[,grep("dumbbell", names(testing))])
+forearm_test <- predict(forearm_pc, testing[,grep("forearm", names(testing))])
+testing <- cbind(testing[1], belt_test, arm_test, dumbbell_test, forearm_test, testing[ncol(testing)])
+colnames(testing) <- c("user_name", "belt_pc1", "belt_pc2", "arm_pc1", "arm_pc2", "dumbbell_pc1", "dumbbell_pc2", "forearm_pc1", "forearm_pc2", "classe")
+```
+
+## Analyze Features
+
+The features are assessed to get a better sense of imbalances in the predictors, potential outliers, groups of points not explained in the predictor and skewed variables.
+
+The strip plot of the features reveals that there is an outlier in the forearm_pc2 variable; this is removed from the dataset.
+
+The skewness and kurtosis of each features were calculated to check for highly-skewed/non-normal distributions. It appears that none of the features are highly skewed.
+
+
+```r
+featurePlot(x = training[,2:(ncol(training)-1)], y = training$classe, plot = "strip")
+```
+
+![](Figs/exploratory analysis-1.png)<!-- -->
+
+```r
+training <- training[!training$forearm_pc2<(-50),]
+
+apply(training[2:(ncol(training)-1)], 2, skewness)
+```
+
+```
+##     belt_pc1     belt_pc2      arm_pc1      arm_pc2 dumbbell_pc1 
+##   1.12077188  -0.92003092   0.58245259  -0.02622320   0.07455597 
+## dumbbell_pc2  forearm_pc1  forearm_pc2 
+##  -0.43348497  -0.34572045  -0.36933551
+```
+
+```r
+apply(training[2:(ncol(training)-1)], 2, kurtosis)
+```
+
+```
+##     belt_pc1     belt_pc2      arm_pc1      arm_pc2 dumbbell_pc1 
+##   -0.2491878    0.7621997   -1.0772925   -1.1729790   -1.0177990 
+## dumbbell_pc2  forearm_pc1  forearm_pc2 
+##    0.2475159   -1.0972595   -0.5182471
+```
+
+## Train Models
+
+Four models are estimated using the training data set. Two of the models are more appropriate for categorical outcome data: penalized multinominal regression and linear discriminant analysis. The other two may be better predictors because they use a more robust set of information to make predictions: random forest and tree bagging.
+
+
+```r
+set.seed(200)
+split_train <- createDataPartition(y = training$classe, p = 0.6, list = FALSE)
+train <- data.frame(training[split_train,])
+cross_val <- data.frame(training[-split_train,])
+## ml = penalized multinomial regression
+ml_modfit <- train(classe ~ ., data = train, method = "multinom", trace = FALSE)
+## lda = linear discriminant analysis
+lda_modfit <- train(classe ~ ., data = train, method = "lda", trace = FALSE)
+## rf = random forest
+train$classe <- as.numeric(train$classe)
+my_control <- trainControl(method = "cv", number = 3 )
+rf_modfit <- train(classe ~ ., data = train, method = "parRF", ntree = 250, trControl=my_control)
+```
+
+```
+## Warning: executing %dopar% sequentially: no parallel backend registered
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```
+## Warning in randomForest.default(ntree = 250, x = structure(c(1, 1, 1, 1, :
+## The response has five or fewer unique values. Are you sure you want to do
+## regression?
+```
+
+```r
+## tb = Treebag
+tb_modfit <- train(classe ~ ., data = train, method = "treebag")
+```
+
+## Cross-Validation Test
+
+After fitting the models, we calculate the error rates of these models in predicting outcomes in the cross-validation. The model that minimizes errors on the cross-validation set will be selected as the best prediction model. Because the cross-validation model was not used to train the model, the errors in predicting the outcome in the cross-validation set is equivalent to the expected out-of-sample error rate.
+
+
+```r
+set.seed(1239)
+## predict outcomes from model on cross-validation set
+cv_ml <- as.numeric(predict(ml_modfit, cross_val))
+cv_lda <- as.numeric(predict(lda_modfit, cross_val))
+cross_val$classe <- as.numeric(cross_val$classe)
+cv_rf <- round(predict(rf_modfit, cross_val))
+cv_tb <- round(predict(tb_modfit, cross_val))
+## estimate error rate
+error_rate <- function(values, prediction) {
+    1 - sum(values == prediction)/length(prediction)
+}
+error_rate(cross_val$classe, cv_ml)
+```
+
+```
+## [1] 0.5000637
+```
+
+```r
+error_rate(cross_val$classe, cv_lda)
+```
+
+```
+## [1] 0.5075844
+```
+
+```r
+error_rate(cross_val$classe, cv_rf)
+```
+
+```
+## [1] 0.2578713
+```
+
+```r
+error_rate(cross_val$classe, cv_tb)
+```
+
+```
+## [1] 0.6655194
+```
+
+The model with the lowest error rate on the cross-validation set is random forest. The estimated out-of-sample error rate is 0.2578713.
